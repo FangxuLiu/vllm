@@ -53,10 +53,14 @@ def validate_hash(args: argparse.Namespace) -> None:
     import torch
     from transformers import AutoConfig
 
-    from vllm.model_executor.models.hy_v3_engram import HYV3EngramHash
-
     model_path = str(Path(args.model).resolve())
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    repository_root = Path(__file__).resolve().parents[1]
+    implementation = _load_module(
+        "hyv3_engram_vllm_impl",
+        repository_root / "vllm/model_executor/models/hy_v3_engram.py",
+    )
+    hasher_cls = implementation.HYV3EngramHash
     reference = _load_module(
         "hyv3_engram_reference_utils", Path(model_path) / "engram_utils.py"
     )
@@ -72,7 +76,7 @@ def validate_hash(args: argparse.Namespace) -> None:
         vocab_map_path=str(map_path),
         layer_head_vocab_sizes=config.engram_layer_head_vocab_sizes,
     )
-    hasher = HYV3EngramHash(config, model_path).to(args.device)
+    hasher = hasher_cls(config, model_path).to(args.device)
 
     sequences = _input_ids(model_path)
     reference_hashes = [
