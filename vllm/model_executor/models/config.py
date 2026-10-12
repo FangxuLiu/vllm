@@ -40,6 +40,40 @@ class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
             logger.info("Using bfloat16 kv-cache for DeepSeekV3.2")
 
 
+class HYV3ForCausalLMConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        config = vllm_config.model_config.hf_config
+        if not getattr(config, "engram_enable", False):
+            return
+
+        from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+        if vllm_config.use_v2_model_runner:
+            raise NotImplementedError(
+                "HYV3 Engram currently supports Model Runner V1 only. Set "
+                "VLLM_USE_V2_MODEL_RUNNER=0."
+            )
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.tensor_parallel_size != 1:
+            raise NotImplementedError("HYV3 Engram currently requires TP=1.")
+        if parallel_config.pipeline_parallel_size != 1:
+            raise NotImplementedError("HYV3 Engram currently requires PP=1.")
+        if parallel_config.use_ubatching:
+            raise NotImplementedError(
+                "HYV3 Engram does not support DBO or microbatching yet."
+            )
+        if vllm_config.speculative_config is not None:
+            raise NotImplementedError(
+                "HYV3 Engram does not support speculative decoding yet."
+            )
+
+        vllm_config.scheduler_config.async_scheduling = False
+        vllm_config.model_config.enforce_eager = True
+        vllm_config.compilation_config.mode = CompilationMode.NONE
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+
 class GlmMoeDsaForCausalLM(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -1067,6 +1101,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Gemma4UnifiedForConditionalGeneration": Gemma4Config,
     "GlmMoeDsaForCausalLM": GlmMoeDsaForCausalLM,
     "GptOssForCausalLM": GptOssForCausalLMConfig,
+    "HYV3ForCausalLM": HYV3ForCausalLMConfig,
     "LongcatFlashNgramForCausalLM": LongcatFlashNgramForCausalLMConfig,
     "GteModel": SnowflakeGteNewModelConfig,
     "GteNewForSequenceClassification": GteNewModelConfig,

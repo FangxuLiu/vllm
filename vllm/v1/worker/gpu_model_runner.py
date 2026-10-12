@@ -1048,8 +1048,11 @@ class GPUModelRunner(
             depth = buf.np.shape[1]
             starts = self.input_batch.num_computed_tokens_cpu[:num_reqs, None]
             pos = starts - np.arange(1, depth + 1)
-            num_prompt = self.input_batch.num_prompt_tokens[:num_reqs, None]
-            valid = (pos >= 0) & (pos < num_prompt)
+            if getattr(self.model, "token_lookback_include_generated", False):
+                available = self.input_batch.num_tokens_no_spec[:num_reqs, None]
+            else:
+                available = self.input_batch.num_prompt_tokens[:num_reqs, None]
+            valid = (pos >= 0) & (pos < available)
             rows = np.arange(num_reqs)[:, None]
             ids = self.input_batch.token_ids_cpu[rows, np.clip(pos, 0, None)]
             buf.np[:num_reqs] = np.where(valid, ids, -1)
@@ -1064,6 +1067,10 @@ class GPUModelRunner(
             model_kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
                 num_reqs
             )
+            if getattr(self.model, "token_lookback_include_generated", False):
+                model_kwargs["engram_query_start_loc"] = self.query_start_loc.gpu[
+                    : num_reqs + 1
+                ]
 
         if not self.is_pooling_model:
             return model_kwargs

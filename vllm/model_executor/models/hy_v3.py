@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only HY model compatible with HuggingFace weights."""
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -68,6 +69,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.sequence import IntermediateTensors
 
+from .hy_v3_engram import HYV3EngramHash, HYV3EngramLayer
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
@@ -372,6 +374,14 @@ class HYV3DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         layer_idx = int(prefix.split(".")[-1])
+        self.layer_idx = layer_idx
+        self.engram_layer = None
+        if getattr(config, "engram_enable", False) and (layer_idx + 1) in getattr(
+            config, "engram_layer_ids", ()
+        ):
+            self.engram_layer = HYV3EngramLayer(
+                config, layer_idx + 1, prefix=f"{prefix}.engram_layer"
+            )
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = HYV3Attention(
             config=config,
@@ -411,8 +421,21 @@ class HYV3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         idx: int = -1,
+        engram_hash_ids: dict[int, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        if residual is None:
+        layer_hash_ids = None
+        if self.engram_layer is not None and engram_hash_ids is not None:
+            layer_hash_ids = engram_hash_ids.get(self.layer_idx + 1)
+
+        if layer_hash_ids is not None:
+            if residual is not None:
+                hidden_states = hidden_states + residual
+            hidden_states = hidden_states + self.engram_layer(
+                hidden_states, layer_hash_ids
+            )
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        elif residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
@@ -446,6 +469,10 @@ class HYV3Model(nn.Module, MixtureOfExperts):
         self.vocab_size = config.vocab_size
         self.config = config
         self.quant_config = quant_config
+        self.engram_hash = None
+        self.engram_runtime_enabled = os.environ.get(
+            "VLLM_HYV3_ENGRAM_DISABLE", "0"
+        ).strip() not in {"1", "true", "yes", "on"}
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -462,6 +489,17 @@ class HYV3Model(nn.Module, MixtureOfExperts):
             ),
             prefix=f"{prefix}.layers",
         )
+        local_engram_layers = {
+            layer_idx + 1
+            for layer_idx in range(self.start_layer, self.end_layer)
+            if layer_idx + 1 in getattr(config, "engram_layer_ids", ())
+        }
+        if (
+            getattr(config, "engram_enable", False)
+            and local_engram_layers
+            and self.engram_runtime_enabled
+        ):
+            self.engram_hash = HYV3EngramHash(config, vllm_config.model_config.model)
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -529,6 +567,8 @@ class HYV3Model(nn.Module, MixtureOfExperts):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
+        engram_query_start_loc: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -541,10 +581,34 @@ class HYV3Model(nn.Module, MixtureOfExperts):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        engram_hash_ids = None
+        if self.engram_hash is not None:
+            if (
+                input_ids is None
+                or lookback_token_ids is None
+                or engram_query_start_loc is None
+            ):
+                raise ValueError(
+                    "HYV3 Engram requires input_ids, lookback_token_ids, and "
+                    "engram_query_start_loc from the model runner."
+                )
+            engram_hash_ids = self.engram_hash(
+                input_ids,
+                positions,
+                lookback_token_ids,
+                engram_query_start_loc,
+            )
+
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
-            hidden_states, residual = layer(positions, hidden_states, residual, idx=idx)
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                residual,
+                idx=idx,
+                engram_hash_ids=engram_hash_ids,
+            )
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
@@ -685,15 +749,31 @@ class HYV3ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    @property
+    def token_lookback_depth(self) -> int:
+        engram_hash = self.model.engram_hash
+        return engram_hash.lookback_depth if engram_hash is not None else 0
+
+    @property
+    def token_lookback_include_generated(self) -> bool:
+        return self.model.engram_hash is not None
+
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
+        engram_query_start_loc: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            lookback_token_ids=lookback_token_ids,
+            engram_query_start_loc=engram_query_start_loc,
         )
 
         return hidden_states
